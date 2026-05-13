@@ -1,0 +1,744 @@
+---
+title: "Bulk RNA-seq Analysis Using GEO Dataset GSE310456"
+author: "Pavel Baykalov"
+date: "2026-05-07"
+output: 
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: no
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# Load libraries
+if(!require(pander)){
+    install.packages("pander")
+}
+if(!require(org.Hs.eg.db)){
+    install.packages("org.Hs.eg.db")
+}
+library(limma)
+library(edgeR)
+library(gplots)
+library(GEOquery)
+library(readxl)
+library(DESeq2)
+library(org.Mm.eg.db)
+library(EnhancedVolcano)
+library(pheatmap)
+library(tidyverse)
+library(GO.db)
+```
+
+# Abstract
+
+Here, I present a reproducible bulk RNA-seq analysis of public GEO dataset GSE310456. The data offers RNA-seq of gonadal white adipose tissue of 15 diabetes resistant (DR) and 15 diabetes prone (DP) female mice, DR animals are healthy animals and are considered as control group[^1].
+
+[^1]: <https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE310456>
+
+# Step-by-Step Procedure
+
+The RNA-seq analysis will consist of data exploration, quality control, data pre-processing, differential expression modelling, data enrichment and biological interpretation. Regarding differential expression modelling (DE), two models from two different packages are going to be used: one from `edgeR` and another from `limma`. The consensus between the models will be presented as the final result of DE modelling.
+
+## Data Discovery and Metadata
+
+First, we download the data GSE310456.
+
+```{r}
+gse <- getGEO("GSE310456", GSEMatrix = TRUE, getGPL = FALSE)
+gse
+```
+
+0 features, indicates there is no counts matrix. 30 samples include: 15 diabetes resistant (DR) and 15 diabetes prone (DP) animals. And there is 45 columns.
+
+We check the Metadata.
+
+```{r}
+data <- gse[[1]]
+experimentData(data)
+```
+
+```{r}
+# Check columns description
+varMetadata(data)
+```
+
+No description about the 45 columns!
+
+How the first three rows look like.
+
+```{r}
+head(pData(data),3)
+```
+
+We notice that some columns are redundant.
+
+## Count Matrix Import and Validation
+
+Next, we download the "count data", which is a huge matrix with samples as columns and its genes as rows. The whole matrix counts the genes appearance in RNA-seq.
+
+```{r, warning=FALSE, message=FALSE}
+supp_files <- getGEOSuppFiles("GSE310456", makeDirectory = TRUE)
+
+count_data <- read_excel("GSE310456/GSE310456_RNASEQ_counts.xlsx", sheet = 1)
+
+# View the first few rows and columns
+head(count_data)
+
+# Check the dimensions (genes x samples)
+dim(count_data)
+```
+
+There are 55401 genes and 30 samples columns + 1 gene ID column.
+
+We need to do some transformation of the count data for an easier use for later steps.
+
+```{r}
+# Turn it into a matrix with gene names as row names
+count_matrix <- as.data.frame(count_data)
+rownames(count_matrix) <- count_matrix[,1]
+count_matrix <- count_matrix[,-1]  # Remove the gene name column
+head(count_matrix,3)
+```
+
+The columns are numbers, which is similar to titles of the data.
+
+```{r}
+# The columns are numbers
+colnames(count_matrix)
+# Similarly to the titles of data
+pData(data)$title
+```
+
+We transform the names of the count matrix, to samples names from the data.
+
+```{r}
+colnames(count_matrix) <- rownames(pData(data))
+head(count_matrix, 3)
+```
+
+Now, the rownames are too complex, the Ensembl IDs for the genes are enough.
+
+```{r}
+# Extract Ensembl IDs from the combined rownames
+gene_ensembl <- gsub("\\|.*", "", rownames(count_matrix))
+
+# Check for duplicates
+sum(duplicated(gene_ensembl))
+
+# Extract gene symbol as well, it will be used later
+gene_symbols <- gsub(".*\\|", "", rownames(count_matrix))
+head(gene_symbols)
+
+# Assign Ensembl IDs as rownames
+rownames(count_matrix) <- gene_ensembl
+
+# Verify
+head(rownames(count_matrix))
+```
+
+Final step before quality control is to convert the data into DGEList format, from `edgeR` library.
+
+```{r}
+d <- DGEList(count_matrix, group = data$`disease state:ch1`, genes = rownames(count_matrix))
+class(d)
+d$samples
+```
+
+The annotation of gene symbols can be done here.
+
+```{r}
+d$genes$Symbol <- gene_symbols
+head(d$genes)
+```
+
+## Count-Level QC and Filtering
+
+Let's look into histogram. We expect right skewed distribution, because of many 0 expressed genes. With `log2(count+1)` we can reduce the range of counts to more shorter scale (0 to 20, instead of 0 to 10000).
+
+```{r}
+hist(log2(d$counts + 1), breaks=100, xlab = "log2(Counts+1)", 
+     main="Histogram of log2(Counts+1)", col="grey", 
+     freq=TRUE,  
+     ylab="Number of Genes")
+```
+
+As expected.
+
+Now, we check the Boxplots for sample-level quality control.
+
+```{r}
+boxplot(log2(d$counts + 1), cex=.5, names=substr(rownames(d$samples), 9, 10))
+```
+
+The boxes look very much the same, with very small variances or differences. Similar spread, similar range and no noticeable outliers with extreme values. The weird shape of boxes can be explained by the huge presence of transcripts with 0 expressions, which we saw previously in the histogram.
+
+### Gene-level QC
+
+We first check genes with zero counts in all 30 samples.
+
+```{r}
+# CPM (counts per million)
+sum(rowSums(cpm(d))==0)
+```
+
+19850 genes out of 55401 genes, have 0 counts in all 30 samples. These genes should be filtered out as they provide no information. An additional filtering rule is based on the smallest group size (the minimum number of biological replicates). Since the smallest treatment group has three samples, we retain genes that achieve more than 1 count per million (CPM) in at least three samples, as recommended by the authors of the `edgeR` package[^2].
+
+[^2]: <https://stat.ethz.ch/pipermail/bioconductor/2014-May/059309.html>
+
+```{r}
+keep <- rowSums(cpm(d) > 1) >= 3
+d_filtered <- d[keep, , keep.lib.sizes = TRUE] 
+nrow(d_filtered)
+```
+
+Next we filter duplicates if they exists.
+
+```{r}
+i <- duplicated(d_filtered$genes$Symbol) ; sum(i)
+d_filtered <- d_filtered[-which(i==TRUE), , keep.lib.size = FALSE] ; rm(i)
+dim(d_filtered)
+```
+
+## Normalization
+
+How the Mean Difference plot looks like now, before normalization.
+
+```{r}
+plotMD(d_filtered,  
+       main = "MD Plot before Normalization",
+       xlab = "Average log CPM",
+       ylab = "log-fold-change")
+abline(h = 0, col = "red", lty = 2, lwd = 2)
+```
+
+The points are flattened and close around M=0, which means it is already good data. Although it is not completely centered on M=0, but it is very close. Both `edgeR` and `limma` packages require previous normalization anyway.
+
+Normalization will be performed using the `calcNormFactors()` function from the `edgeR` package, which by default applies the TMM method or 'Trimmed Mean of M-values', a method that is quite robust and widely used.
+
+```{r}
+d_filtered <- calcNormFactors(d_filtered)
+head(d_filtered$samples)
+```
+
+Now, we check the boxplot again.
+
+```{r}
+# Get normalized log2 CPM values
+logcpm_norm <- cpm(d_filtered, log = TRUE)
+boxplot(logcpm_norm, cex=.5, names=substr(rownames(d_filtered$samples), 9, 10))
+```
+
+Everything is still aligned and looks better than with raw. The negative y-axis values are due to the log2 transformation.
+
+Now we check again, intensity-dependent bias with MD (Mean Difference) plot.
+
+```{r}
+plotMD(d_filtered,  
+       main = "MD Plot After TMM Normalization",
+       xlab = "Average log CPM",
+       ylab = "log-fold-change")
+abline(h = 0, col = "red", lty = 2, lwd = 2)
+```
+
+The points are flattened and centered around M=0, as preious to normalization.
+
+## Exploratory Analysis and Outlier Assessment
+
+We check any change in library sizes, if any.
+
+```{r}
+# Library sizes before filtering and normalizing
+barplot(d$samples$lib.size*1e-6, names=substr(rownames(d$samples), 9, 10), 
+        ylab="Library size (millions)", main="original data")
+
+```
+
+```{r}
+# Library sizes after filtering and normalizing
+barplot(d_filtered$samples$lib.size*1e-6, names=substr(rownames(d_filtered$samples), 9, 10), 
+        ylab="Library size (millions)", main="normalized data")
+```
+
+Library sizes remained consistent after TMM normalization, as expected since TMM calculates normalization factors rather than rescaling library sizes.
+
+Multidimensional scaling represent leading log-fold-changes between samples.
+
+```{r}
+# MDS plot colored by group
+plotMDS(d_filtered, 
+        col = ifelse(d_filtered$samples$group == "diabetes-prone", "red", "blue"),
+        pch = 19, cex = 1.2,
+        main = "MDS Plot: Diabetes-Prone vs Diabetes-Resistant")
+
+legend("topright",
+       legend = c("Diabetes-Prone", "Diabetes-Resistant"),
+       col = c("red", "blue"),
+       pch = 19,
+       cex = 0.8)
+```
+
+The MDS plot shows clear separation between diabetes-prone and diabetes-resistant samples along dimension 1, indicating distinct expression profiles between groups. However, there is one sample (diabetes resistant) which is different from all, only noticeable in 2 dimension.
+
+The otulier is.
+
+```{r}
+mds <- plotMDS(d_filtered, plot = FALSE)
+dim2 <- mds$y
+
+names(dim2) <- colnames(d_filtered)
+
+# Find the outlier on Dimension 2
+dim2_sorted <- sort(dim2)
+print(dim2_sorted)
+
+# Identify the extreme sample
+outlier_dim2 <- names(which.max(abs(dim2)))
+cat("Sample with extreme Dimension 2:", outlier_dim2, "\n")
+cat("Group:", as.character(d_filtered$samples[outlier_dim2, "group"]), "\n")
+cat("Dim 2 value:", dim2[outlier_dim2], "\n")
+```
+
+I am going to create two datasets one with outlier, and another without.
+
+```{r}
+# Dataset 1: Full data (with outlier)
+d_full <- d_filtered
+
+# Dataset 2: Clean data (without outlier)
+samples_to_keep <- colnames(d_filtered) != "GSM9301656"
+d_clean <- d_filtered[, samples_to_keep]
+d_clean$samples$lib.size <- colSums(d_clean$counts)
+
+# Name them clearly
+cat("Full dataset:", ncol(d_full), "samples\n")
+cat("Clean dataset:", ncol(d_clean), "samples\n")
+```
+
+Later, we will see with differential expression analysis if the supposed outlier makes a difference or not. This will be our sensitivity test.
+
+## Differential Expression (DE)
+
+Two packages `edgeR` and `limma` will be used for modelling, as two separated models. While `edgeR` uses `estimateDisp` for estimate the dispersion and `glmQLFit` to fit log-lineal negative binomial model; `limma` uses `voom` to estimate mean variance, then `lmFit` to fit lineal model and `eBayes` to compute statistics. Both models require a design matrix that converts experimental groups ( "diabetes-prone" and "diabetes-resistant") into a numerical format. Design matrix is the predictor, meanwhile the count matrix is the outcome we want to predict.
+
+```{r}
+# Function that runs both edgeR and limma analyses
+run_my_pipeline <- function(dge_obj, dataset_name) {
+  
+  cat("\n", paste(rep("=", 50), collapse=""), "\n")
+  cat("Running analysis on:", dataset_name, "\n")
+  cat("Samples:", ncol(dge_obj), "\n")
+  cat(paste(rep("=", 50), collapse=""), "\n")
+  
+  # Design matrix
+  design <- model.matrix(~ group, data = dge_obj$samples)
+  
+  # edgeR: estimate dispersion
+  y <- estimateDisp(dge_obj, design, robust = TRUE)
+  cat("\nDispersion summary:\n")
+  print(summary(y$tagwise.dispersion))
+  
+  # edgeR: QL fit
+  fit <- glmQLFit(y, design, robust = TRUE)
+  
+  # edgeR: QL F-test
+  qlf <- glmQLFTest(fit, coef = 2)
+  
+  # edgeR results (top 1000 for quick comparison)
+  edgeR_results <- topTags(qlf, n = Inf, sort.by = "PValue")$table
+  edgeR_results$gene <- rownames(edgeR_results)
+  
+  # limma: voom
+  v <- voom(dge_obj, design, plot = TRUE)  
+  
+  # limma: fit
+  lfit <- lmFit(v, design)
+  lfit <- eBayes(lfit)
+  
+  # limma results
+  limma_results <- topTable(lfit, coef = 2, n = Inf, sort.by = "P")
+  limma_results$gene <- rownames(limma_results)
+  
+  # Return everything
+  return(list(
+    name = dataset_name,
+    n_samples = ncol(dge_obj),
+    edgeR = list(
+      y = y,
+      fit = fit,
+      qlf = qlf,
+      results = edgeR_results
+    ),
+    limma = list(
+      v = v,
+      fit = lfit,
+      results = limma_results
+    )
+  ))
+}
+```
+
+```{r}
+results_full <- run_my_pipeline(d_full, "Full Dataset (with outlier)")
+```
+
+```{r}
+results_clean <- run_my_pipeline(d_clean, "Clean Dataset (without outlier)")
+```
+
+Let's compare `edgeR` results. We filter DE genes by False Discovery Rate less than 0.05; it means at most 5% of DE gene list is expected to be false. It is better than p-value which only reflects the per-test error rate, and do not take into account the whole DE gene list.
+
+```{r}
+# Get significant genes from edgeR (FDR < 0.05)
+sig_edgeR_full <- rownames(results_full$edgeR$results[results_full$edgeR$results$FDR < 0.05, ])
+sig_edgeR_clean <- rownames(results_clean$edgeR$results[results_clean$edgeR$results$FDR < 0.05, ])
+
+# 1. Number of DE genes
+length(sig_edgeR_full)   # How many DE genes in full dataset
+length(sig_edgeR_clean)  # How many DE genes in clean dataset
+
+# 2. Jaccard similarity/ IoU (0-1, higher = more similar)
+length(intersect(sig_edgeR_full, sig_edgeR_clean)) / length(union(sig_edgeR_full, sig_edgeR_clean))
+
+# 3. Correlation of logFC (common genes only)
+common <- intersect(rownames(results_full$edgeR$results), rownames(results_clean$edgeR$results))
+cor(results_full$edgeR$results[common, "logFC"], 
+    results_clean$edgeR$results[common, "logFC"])
+```
+
+The DE genes number are very similar, the similarity of them is also high. However, most importantly is correlation of logFC (Log Fold Change), which is high as well. LogFC measures the relative change in gene expression or feature abundance between two conditions (diabetes-prone and diabetes-resistant), we don't see the values directly, rather the correlation between two datasets.
+
+Now `limma` results. Instead of FDR, `limma` package presents us with adjusted p-value, similar to FDR. So, we again filter by less than 0.05 `adj.P.Val` .
+
+```{r}
+# Get significant genes from limma (adj.P.Val < 0.05)
+sig_limma_full <- rownames(results_full$limma$results[results_full$limma$results$adj.P.Val < 0.05, ])
+sig_limma_clean <- rownames(results_clean$limma$results[results_clean$limma$results$adj.P.Val < 0.05, ])
+
+# 1. Number of DE genes
+length(sig_limma_full)
+length(sig_limma_clean)
+
+# 2. Jaccard similarity/IoU
+length(intersect(sig_limma_full, sig_limma_clean)) / length(union(sig_limma_full, sig_limma_clean))
+
+# 3. Correlation of logFC
+common_limma <- intersect(rownames(results_full$limma$results), rownames(results_clean$limma$results))
+cor(results_full$limma$results[common_limma, "logFC"], 
+    results_clean$limma$results[common_limma, "logFC"])
+
+```
+
+Very much the same as with `edgeR`, and the correlation between logFC is even higher.
+
+Thus, we can conclude that the outlier doesn't distort significantly the DE modelling, and we can keep the full data for DE genes determination. The difference observed for this particular sample is likely due to natural biological variance rather than technical artifact.
+
+Results from edgeR
+
+```{r}
+top1 <- results_full$edgeR$results
+top1 <- top1[top1$FDR < 0.05, ]  # Keep only significant genes
+top1 <- top1[order(top1$PValue), ][,c(-1,-8)]  # Sort by p-value
+dim(top1)
+head(top1, 20)
+```
+
+Results from Limma:
+
+```{r}
+top2 <- results_full$limma$results
+top2 <- top2[top2$adj.P.Val < 0.05, ]  # Keep only significant genes
+top2 <- top2[order(top2$P.Value), ][,c(-1,-9)]  # Sort by p-value
+dim(top2)
+head(top2, 20)
+```
+
+Method agreement.
+
+```{r}
+shared <- intersect(rownames(top1), rownames(top2))
+length(shared)
+```
+
+Selection where both methods agree.
+
+```{r}
+top <- top1[rownames(top1) %in% shared, ]
+dim(top)
+head(top, 20)
+```
+
+### MA plots
+
+An MA plot visualizes differential expression by plotting log fold change (M) against average expression (A), with most genes centered near zero. It is used to assess normalization quality, identify differentially expressed genes, and detect intensity-dependent bias such as fan-shaped trends.
+
+```{r}
+# MA plot for edgeR using full dataset
+plotMD(results_full$edgeR$qlf, 
+       status = decideTests(results_full$edgeR$qlf), 
+       main = "edgeR: Differentially Expressed Genes (Full Dataset)",
+       legend = FALSE,
+       xlab = "Average log2 CPM",
+       ylab = "log2 Fold Change")
+abline(h = c(-1, 1), col = "blue", lty = 2, lwd = 1.5)
+abline(h = 0, col = "red", lty = 2, lwd = 1)
+
+legend("topright",
+       legend = c("Up in Prone", "Down in Prone", "Not DE"),
+       col = c("red", "blue", "black"),
+       pch = 20, cex = 0.8)
+```
+
+Limma based MA plot.
+
+```{r}
+# MA plot for limma using full dataset
+# Create status vector for limma results
+status <- decideTests(results_full$limma$fit)[, 2]
+status[status == 0] <- "non-DE"
+status[status == 1] <- "Up"
+status[status == -1] <- "Down"
+
+plotMD(results_full$limma$fit, 
+       column = 2,
+       hl.col = c("red", "blue", "black"), 
+       values = c("Up", "Down", "non-DE"), 
+       status = status,
+       main = "limma: Differentially Expressed Genes (Full Dataset)",
+       xlab = "Average log2 Expression",
+       ylab = "log2 Fold Change")
+abline(h = c(-1, 1), col = "blue", lty = 2, lwd = 1.5)
+abline(h = 0, col = "red", lty = 2, lwd = 1)
+```
+
+Presents more non-DE than `edgeR` model!
+
+### Volcano plot
+
+A volcano plot displays statistical significance (-log10 FDR) against effect size (log fold change), allowing immediate visualization of both metrics simultaneously. It is used to identify differentially expressed genes with large magnitude changes and high confidence, while also providing a quality control check for balanced up/down regulation.
+
+We use here the agreement between the models.
+
+```{r, warning=FALSE, message=FALSE,fig.width=10, fig.height=7, out.width="100%", out.height="auto"}
+library(EnhancedVolcano)
+# Create a combined results table with all genes
+all_genes <- results_full$edgeR$results
+
+# Add column for method agreement
+all_genes$method_agreement <- "Only edgeR"
+all_genes$method_agreement[rownames(all_genes) %in% rownames(top2)] <- "Both methods"
+all_genes$method_agreement[all_genes$FDR >= 0.05] <- "Not significant"
+
+# Custom volcano plot
+EnhancedVolcano(all_genes,
+                lab = all_genes$Symbol,
+                x = "logFC",
+                y = "FDR",
+                pCutoff = 0.05,
+                FCcutoff = 1.0,
+                title = "Diabetes-Resistant vs Diabetes-Prone",
+                subtitle = "Adipose tissue RNA-seq",
+                caption = paste0("DEGs in both methods: ", nrow(top), 
+                                " | Total DEGs (edgeR): ", sum(all_genes$FDR < 0.05)),
+                legendPosition = "right",
+                legendLabSize = 12,
+                colAlpha = 0.5,
+                pointSize = 1.5,
+                drawConnectors = TRUE,
+                widthConnectors = 0.3,
+                max.overlaps = 20)
+```
+
+We can notice here, in grey the genes with no difference, in blue genes with high expression differences but statistically uncertain (likely due to high variance), then in green relevant genes but with not enough magnitude of expression, and finally in red true differentially expressed genes with higher than log2 fold change.
+
+### Heatmap
+
+First, we selected genes with logFC.
+
+```{r}
+sel_genes <- rownames(top[which((top$logFC>=1) | (top$logFC<=-1)),]) ; length(sel_genes) 
+```
+
+```{r}
+# Get symbols 
+sel_symbols <- gsub(".*\\|", "", names(sel_genes))
+
+design <- model.matrix(~ group, data = d_full$samples)
+y <- estimateDisp(d_full, design, robust = TRUE)
+
+# Subset and label heatmap data
+heatmap_data <- cpm(y, log = TRUE)[sel_genes, ]
+rownames(heatmap_data) <- sel_symbols
+
+# Sample annotation
+annotation_col <- data.frame(Group = y$samples$group, 
+                             row.names = colnames(heatmap_data))
+
+# Heatmap
+library(pheatmap)
+pheatmap(heatmap_data,
+         annotation_col = annotation_col,
+         scale = "row",
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         treeheight_row = 0,
+         treeheight_col = 0,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         fontsize_row = 4,
+         main = "DEGs")
+```
+
+The heatmap shows two blocks within this `sel_genes` number, both opposite to each other when expressing in prone and non-prone to diabetes mice. The switch of those genes is almost the opposite in all samples.
+
+## Annotation and Enrichment
+
+### GO and KEGG
+
+Now we will analyze the biological significance, using enrichment with two databases: **GO** o *Gene Ontology*[^3] y **KEGG** o *Kyoto Encyclopedia of Genes and Genomes*[^4]. The first brings together molecular functions, cellular components, and biological processes; while the second is oriented toward metabolic pathways.
+
+[^3]: <http://geneontology.org/>
+
+[^4]: <https://www.genome.jp/kegg/>
+
+To collect information from the databases, the functions of the `limma` package, such as `goana()` and `kegga`, allow it to be done directly on the model. But since there is only one limma model, the genes selected previously will be used, which, in addition to being significant and shared by the two models used in the report, have logFC \> \|1\|.
+
+We need *Entrez* format, so we check it first.
+
+```{r}
+# Check format
+head(sel_genes)
+```
+
+They start with "ENSMUSG" (not *Entrez* format), so we convert them:
+
+```{r}
+library(org.Mm.eg.db)
+
+# Convert Ensembl to Entrez
+entrez_ids <- mapIds(org.Mm.eg.db,
+                     keys = sel_genes,
+                     column = "ENTREZID",
+                     keytype = "ENSEMBL")
+
+# Remove NAs
+entrez_ids <- entrez_ids[!is.na(entrez_ids)]
+length(entrez_ids)
+```
+
+Now, we do the search in both databases for the IDs.
+
+```{r}
+go <- goana(entrez_ids, species = "Mm") ; dim(go)
+```
+
+```{r}
+kegg <- kegga(entrez_ids, species = "Mm") ; dim(kegg)
+```
+
+Now we generate top list from both databases matches.
+
+```{r}
+GO <- topGO(go, ont="BP", n=25)#[1:3]
+KEGG <- topKEGG(kegg, n=25)#[1:2]
+
+require(pander)
+pander(GO, emphasize.rownames=FALSE, split.table = Inf)
+```
+
+Ontological GO category: BP = Biological Process, MF = Molecular Function, CC = Cellular Component. *N* is total genes annotated, and *DE* is differentially expressed genes. *P.DE*: p-value.
+
+The table maybe overwhelming, so we could represent top 25 GO terms in a dot plot.
+
+```{r}
+library(ggplot2)
+
+go_plot <- GO 
+
+
+# Calculate log10 P-value
+go_plot$logP <- -log10(go_plot$P.DE)
+
+# Plot
+ggplot(go_plot, aes(x = logP, y = reorder(Term, logP))) +
+    geom_point(aes(size = DE), color = "steelblue") +
+    labs(x = "-log10(P-value)", 
+         y = "",
+         size = "Gene count",
+         title = "GO Biological Processes") +
+    theme_bw() +
+    theme(axis.text.y = element_text(size = 9))
+```
+
+Now check the metabolic pathways.
+
+```{r}
+pander(KEGG, split.table = Inf) 
+```
+
+KEGG dot plot.
+
+```{r}
+kegg_plot <- KEGG#[1:20, ]
+kegg_plot$logP <- -log10(kegg_plot$P.DE)
+
+ggplot(kegg_plot, aes(x = logP, y = reorder(Pathway, logP))) +
+    geom_point(aes(size = DE), color = "darkred") +
+    labs(x = "-log10(P-value)", y = "", size = "Gene count",
+         title = "KEGG Pathways") +
+    theme_bw()
+```
+
+Many terms are related to immune system, in both lists (GO and KEGG).
+
+We could also try to search for diabetes related terms like "insulin", "glucose" or "diabetes" itself.
+
+Check the diabetic terms within GO terms.
+
+```{r}
+# Search GO terms for diabetes-related keywords
+keywords <- "insulin|glucose|diabetes"
+
+diabetes_go <- go[grep(keywords, go$Term, ignore.case = TRUE), ]
+
+# Show top hits sorted by P-value
+diabetes_go <- diabetes_go[order(diabetes_go$P.DE), ]
+head(diabetes_go[], 20)
+dim(diabetes_go)
+```
+
+Ontological GO category: BP = Biological Process, MF = Molecular Function, CC = Cellular Component. *N* is total genes annotated, and *DE* is differentially expressed genes. *P.DE*: p-value.
+
+We can clearly see there are such terms, exactly 127 terms.
+
+Check the diabetic terms within KEGG pathways.
+
+```{r}
+diabetes_kegg <- kegg[grep(keywords, kegg$Pathway, ignore.case = TRUE), ]
+
+# Show results
+diabetes_kegg[, ]
+dim(diabetes_kegg)
+```
+
+Here there are such terms as well, but much less, only 6. Most of these are related to insulin and diabetes.
+
+## Summary
+
+During the analysis we identified one sample outlier with MDS analysis. However, after modelling comparison or sensitivity test, this outlier or this particular sample present some differences that may be due to the biological variance rather than technical artifacts.
+
+Regarding the DE, both models (one from `edgeR` another from `limma`) identified around `r nrow(top)` genes which they agree they are DE. Those DEGs are the ones who are significantly expressed and in more than log2 fold change. They appeared selected as the ones who plays the differential roles when separating both groups "diabetes-resistant" and "diabetes-prone" mice.
+
+A close check of DEGs by using the enrichment, show us not only just diabetes and insulin related genes, but the immuno-related genes (immuno response, defense, inflammatory response, B cell receptor, IL-17, etc).
+
+# Session info
+
+```{r}
+sessionInfo()
+```
