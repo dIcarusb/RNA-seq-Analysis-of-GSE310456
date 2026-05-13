@@ -22,7 +22,7 @@ Reproducible bulk RNA-seq analysis of GEO dataset [GSE310456](https://www.ncbi.n
 ## Files
 
 - `Bulk RNA-seq Analysis Using GEO Dataset GSE310456.Rmd` — R Markdown source (reproducible)
-- `Bulk RNA-seq Analysis Using GEO Dataset GSE310456.html` — Rendered report (view online)
+- `Bulk RNA-seq Analysis Using GEO Dataset GSE310456.html` — Rendered report ([view online](https://github.com/dIcarusb/RNA-seq-Analysis-of-GSE310456/blob/main/Bulk-RNA-seq-Analysis-Using-GEO-Dataset-GSE310456.html))
 
 ## How to Reproduce
 
